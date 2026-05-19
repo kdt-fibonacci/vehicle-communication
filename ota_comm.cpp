@@ -13,42 +13,67 @@
 
 using json = nlohmann::json;
 
-// --- 구조체 정의 ---
+// --- [상태 머신 정의] ---
+enum class OtaState {
+    OFF,
+    IDLE,
+    WAIT,
+    READY,
+    DOWNLOAD,
+    VERIFICATION,
+    INSTALL,
+    WAIT_ACTIVATION,
+    ACTIVATION,
+    RECOVERY,
+    REPORTING
+};
+
+const std::string StateStrings[] = {
+    "OFF", "IDLE", "WAIT", "READY", "DOWNLOAD", "VERIFICATION", 
+    "INSTALL", "WAIT_ACTIVATION", "ACTIVATION", "RECOVERY", "REPORTING"
+};
+
+OtaState currentOtaState = OtaState::OFF;
+
+void changeState(OtaState newState) {
+    std::cout << "\n==================================================" << std::endl;
+    std::cout << "[STATE CHANGED] " << StateStrings[static_cast<int>(currentOtaState)] 
+              << " ➡️ " << StateStrings[static_cast<int>(newState)] << std::endl;
+    std::cout << "==================================================" << std::endl;
+    currentOtaState = newState;
+}
+
 struct EcuVersion {
     std::string address;
     std::string version;
 };
 
-// --- 전역 설정 및 상수 ---
 const std::string VERSION_FILE = "./ecu_versions.json";
-const std::string CHECK_URL = "http://192.168.201.54:4321/ota/check";
-const std::string REPORT_URL = "http://192.168.201.54:4321/ota/report"; // 리포트 전용 주소
-const std::string MQTT_ADDRESS = "tcp://192.168.201.54:1883";
+const std::string CHECK_URL = "http://192.168.200.135:4321/ota/check";
+const std::string REPORT_URL = "http://192.168.200.135:4321/ota/report";
+const std::string MQTT_ADDRESS = "tcp://192.168.200.135:1883";
 const std::string CLIENT_ID = "RPi_OTA_Client";
 const std::string TOPIC = "ota/update";
 const std::string DEVICE_ID = "0001";
 const std::string LOCAL_PUBLIC_KEY_PATH = "./public.pem";
 const std::string GATEWAY_IP = "192.168.1.20";
 
-// --- 외부 모듈 함수 선언 (NRC 처리를 위해 int로 변경) ---
+// --- 외부 모듈 함수 순수 참조 선언 ---
 extern bool verifyFirmwareSecurity(const std::string& addr, const std::string& version, const std::string& publicKeyPath);
-extern int startOtaTransfer(const std::string& targetAddrStr, const std::string& version, const std::string& gatewayIp);
+extern int startOtaTransfer(const std::string& targetAddrStr, const std::string& version, const std::string& gatewayIp, void (*stateCallback)(OtaState));
 
-// --- [헬퍼 함수] ---
 std::string toHexStr(int val) {
     std::stringstream ss;
     ss << "0x" << std::uppercase << std::hex << std::setw(2) << std::setfill('0') << val;
     return ss.str();
 }
 
-// CURL용 쓰기 콜백
 static size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userp) {
     size_t realsize = size * nmemb;
     if (userp) ((std::string*)userp)->append((char*)contents, realsize);
     return realsize;
 }
 
-// 파일 다운로드 함수 (중요: 정의가 포함되어야 함)
 bool downloadFile(const std::string& url, const std::string& save_path) {
     CURL *curl = curl_easy_init();
     if (!curl) return false;
@@ -71,7 +96,6 @@ bool downloadFile(const std::string& url, const std::string& save_path) {
     return true;
 }
 
-// --- [1] 서버 상태 보고 함수 ---
 void reportStatusToServer(std::string addr, std::string ver, std::string status, std::string nrc = "0x00") {
     CURL *curl = curl_easy_init();
     if (!curl) return;
@@ -90,14 +114,13 @@ void reportStatusToServer(std::string addr, std::string ver, std::string status,
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data.c_str());
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
-    std::cout << "[Report] Status: " << status << " (NRC: " << nrc << ") Sent to server." << std::endl;
+    std::cout << "[Report Content] Status: " << status << " (NRC: " << nrc << ") Forwarding to backend server." << std::endl;
     curl_easy_perform(curl);
 
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
 }
 
-// --- [2] 버전 관리 시스템 ---
 std::vector<EcuVersion> loadLocalVersions() {
     std::vector<EcuVersion> ecus;
     std::ifstream file(VERSION_FILE);
@@ -120,32 +143,41 @@ void saveLocalVersion(const std::string& addr, const std::string& new_ver) {
     if (file.is_open()) file << j.dump(4);
 }
 
-// --- [3] 핵심 업데이트 실행 로직 ---
 void executeUpdate(const std::string& addr, const std::string& ver, const std::string& f_url, const std::string& s_url) {
     std::cout << "\n----------------------------------------" << std::endl;
     std::cout << ">> [OTA Engine] Processing ECU 0x" << addr << " v" << ver << std::endl;
 
+    // State 5: DOWNLOAD
+    changeState(OtaState::DOWNLOAD);
     reportStatusToServer(addr, ver, "DOWNLOADING");
 
     std::string hex_file = addr + "_" + ver + ".hex";
     std::string sig_file = addr + "_" + ver + ".sig";
 
-    // 1. 다운로드
     if (!downloadFile(f_url, hex_file) || !downloadFile(s_url, sig_file)) {
-        reportStatusToServer(addr, ver, "FAILED", "0xFF"); // 0xFF: 다운로드 에러 코드(임의)
+        changeState(OtaState::REPORTING);
+        reportStatusToServer(addr, ver, "FAILED", "0xFF");
+        changeState(OtaState::WAIT);
         return;
     }
 
-    // 2. 보안 검증
+    // State 6: VERIFICATION (구현부가 오염되지 않도록 ota_security.cpp의 외부 함수만 깨끗하게 호출)
+    changeState(OtaState::VERIFICATION);
     if (!verifyFirmwareSecurity(addr, ver, LOCAL_PUBLIC_KEY_PATH)) {
+        changeState(OtaState::REPORTING);
         reportStatusToServer(addr, ver, "AUTH_FAILED");
+        changeState(OtaState::WAIT);
         return;
     }
 
-    // 3. UDS 전송 (NRC 대응)
+    // State 7: INSTALL
+    changeState(OtaState::INSTALL);
     reportStatusToServer(addr, ver, "FLASHING");
-    int result = startOtaTransfer(addr, ver, GATEWAY_IP);
+    
+    int result = startOtaTransfer(addr, ver, GATEWAY_IP, changeState);
 
+    // State 11: REPORTING
+    changeState(OtaState::REPORTING);
     if (result == 0) {
         std::cout << "✅ [Success] Update sequence finished!" << std::endl;
         reportStatusToServer(addr, ver, "SUCCESS");
@@ -155,15 +187,13 @@ void executeUpdate(const std::string& addr, const std::string& ver, const std::s
         std::cerr << "❌ [Error] Failed with NRC: " << nrc_hex << std::endl;
         reportStatusToServer(addr, ver, "FAILED", nrc_hex);
     }
+    
+    changeState(OtaState::WAIT);
     std::cout << "----------------------------------------" << std::endl;
 }
 
-// --- [4] 초기 동기화 및 MQTT 콜백 ---
-
 void performInitialSync() {
-    std::cout << "[Init] Checking for updates via HTTP..." << std::endl;
     auto localEcus = loadLocalVersions();
-    
     CURL *curl = curl_easy_init();
     if (!curl) return;
 
@@ -188,6 +218,7 @@ void performInitialSync() {
             auto res_json = json::parse(response_string);
             for (const auto& update : res_json["updates"]) {
                 if (update.value("update", false)) {
+                    changeState(OtaState::READY); // State 4: READY
                     executeUpdate(update["address"], update["version"], 
                                   update["firmware_url"], update["signature_url"]);
                 }
@@ -195,10 +226,7 @@ void performInitialSync() {
         } catch (const std::exception& e) {
             std::cerr << "[Error] Initial Sync JSON Error: " << e.what() << std::endl;
         }
-    } else {
-        std::cerr << "[Error] Initial Sync HTTP Failed: " << curl_easy_strerror(res) << std::endl;
     }
-
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
 }
@@ -206,7 +234,7 @@ void performInitialSync() {
 class ota_callback : public virtual mqtt::callback {
     void message_arrived(mqtt::const_message_ptr msg) override {
         std::string payload = msg->get_payload_str();
-        std::cout << "\n[MQTT] Push Notification: " << payload << std::endl;
+        std::cout << "\n[MQTT] Push Notification Received: " << payload << std::endl;
 
         try {
             auto data = json::parse(payload);
@@ -214,16 +242,15 @@ class ota_callback : public virtual mqtt::callback {
                 std::string addr = data["address"];
                 std::string ver = data["version"];
 
-                // 중복 체크
                 auto localEcus = loadLocalVersions();
                 for (const auto& ecu : localEcus) {
                     if (ecu.address == addr && ecu.version == ver) {
-                        std::cout << ">> [Skip] ECU 0x" << addr << " is already version " << ver << std::endl;
+                        std::cout << ">> [Skip] ECU 0x" << addr << " is already up-to-date." << std::endl;
                         return;
                     }
                 }
                 
-                // 즉시 업데이트 수행 (MQTT 페이로드 데이터 활용)
+                changeState(OtaState::READY); // State 4: READY
                 executeUpdate(addr, ver, data["firmware_url"], data["signature_url"]);
             }
         } catch (const std::exception& e) {
@@ -236,15 +263,13 @@ class ota_callback : public virtual mqtt::callback {
     }
 };
 
-// --- [5] 서비스 시작점 ---
-
 void runOtaService() {
+    changeState(OtaState::IDLE); // State 2: IDLE
     curl_global_init(CURL_GLOBAL_ALL);
 
-    // 1. 초기 1회 HTTP 체크
     performInitialSync();
 
-    // 2. MQTT 대기 모드 진입
+    changeState(OtaState::WAIT); // State 3: WAIT
     try {
         mqtt::async_client client(MQTT_ADDRESS, CLIENT_ID);
         ota_callback cb;
@@ -265,9 +290,6 @@ void runOtaService() {
         }
     } catch (const mqtt::exception& e) {
         std::cerr << "[MQTT Critical] Error: " << e.what() << std::endl;
-    } catch (const std::exception& e) {
-        std::cerr << "[System Critical] Runtime Error: " << e.what() << std::endl;
     }
-
     curl_global_cleanup();
 }

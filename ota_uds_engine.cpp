@@ -1,3 +1,4 @@
+// ota_uds_engine.cpp
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -11,12 +12,16 @@
 const int DOIP_PORT = 13400;
 const uint16_t RPI_SA = 0x0E00; 
 
+enum class OtaState {
+    OFF, IDLE, WAIT, READY, DOWNLOAD, VERIFICATION, 
+    INSTALL, WAIT_ACTIVATION, ACTIVATION, RECOVERY, REPORTING
+};
+
 struct DataChunk {
     uint32_t address;
     std::vector<uint8_t> data;
 };
 
-// --- [헬퍼 함수] ---
 uint8_t hstob(const std::string& hex) { return (uint8_t)std::stoul(hex, nullptr, 16); }
 
 uint32_t calculateChunkChecksum(const std::vector<uint8_t>& data) {
@@ -25,7 +30,6 @@ uint32_t calculateChunkChecksum(const std::vector<uint8_t>& data) {
     return sum;
 }
 
-// DoIP/UDS 패킷 송신
 void sendUdsPacket(int sock, uint16_t targetAddr, uint8_t sid, const std::vector<uint8_t>& payload) {
     uint32_t udsLen = payload.size() + 1;
     uint32_t doipPayloadLen = udsLen + 4;
@@ -41,23 +45,24 @@ void sendUdsPacket(int sock, uint16_t targetAddr, uint8_t sid, const std::vector
     send(sock, pkt.data(), pkt.size(), 0);
 }
 
-// 응답 분석 (NRC 추출)
-int checkUdsResponse(uint8_t* res, int len, uint8_t expectedPositiveSid) {
-    if (len < 13) {
-        std::cout << "   [DEBUG] Error: Response too short or Timeout." << std::endl;
-        return -1;
-    }
+int checkUdsResponse(uint8_t* res, int len, uint8_t expectedPositiveSid, uint16_t expectedRid = 0) {
+    if (len < 13) return -100;
     uint8_t sid = res[12];
-    if (sid == expectedPositiveSid) {
-        return 0; // 성공
-    } else if (sid == 0x7F) {
-        std::cout << "   [DEBUG] !!! Negative Response (NRC: 0x" << std::hex << (int)res[14] << std::dec << ") !!!" << std::endl;
-        return res[14]; // NRC 번호 반환
-    }
-    return -2;
-}
 
-// --- [UDS 서비스 로직] ---
+    if (sid == expectedPositiveSid) {
+        if (expectedRid != 0) {
+            uint16_t receivedRid = (res[14] << 8) | res[15];
+            if (receivedRid != expectedRid) return -101;
+        }
+        return 0;
+    } 
+    else if (sid == 0x7F) {
+        uint8_t nrc = res[14];
+        if (nrc == 0x78) return 0x78;
+        return nrc;
+    }
+    return -102;
+}
 
 bool routingActivation(int sock) {
     uint8_t actReq[11] = {0x02, 0xFD, 0x00, 0x05, 0x00, 0x00, 0x00, 0x03, 0x0E, 0x00, 0x00};
@@ -69,7 +74,7 @@ bool routingActivation(int sock) {
 
 int enterProgrammingSession(int sock, uint16_t targetAddr) {
     std::cout << "[UDS] Entering Programming Session (0x10 03)..." << std::endl;
-    sendUdsPacket(sock, targetAddr, 0x10, {0x03}); // 0x03: Extended/Programming
+    sendUdsPacket(sock, targetAddr, 0x10, {0x03});
     uint8_t res[64];
     int len = recv(sock, res, sizeof(res), 0);
     return checkUdsResponse(res, len, 0x50);
@@ -101,8 +106,17 @@ int verifyIntegrity(int sock, uint16_t targetAddr, uint32_t checksum) {
     return checkUdsResponse(res, len, 0x71);
 }
 
-// --- [메인 엔진] ---
-int startOtaTransfer(const std::string& targetAddrStr, const std::string& version, const std::string& gatewayIp) {
+int requestBankSwap(int sock, uint16_t targetAddr) {
+    std::cout << "\n[UDS] Target Activation Phase. Sending A/B Bank Swap (0x31 01 FF 02)..." << std::endl;
+    std::vector<uint8_t> p = { 0x01, 0xFF, 0x02 }; 
+    sendUdsPacket(sock, targetAddr, 0x31, p);
+    
+    uint8_t res[64];
+    int len = recv(sock, res, sizeof(res), 0);
+    return checkUdsResponse(res, len, 0x71);
+}
+
+int startOtaTransfer(const std::string& targetAddrStr, const std::string& version, const std::string& gatewayIp, void (*stateCallback)(OtaState)) {
     uint16_t targetAddr = (uint16_t)std::stoul(targetAddrStr, nullptr, 16);
     std::string hexPath = targetAddrStr + "_" + version + ".hex";
     
@@ -121,52 +135,39 @@ int startOtaTransfer(const std::string& targetAddrStr, const std::string& versio
             uint32_t fullAddr = baseAddr + offset;
             std::vector<uint8_t> d;
             for (int i = 0; i < len; i++) d.push_back(hstob(line.substr(9 + (i * 2), 2)));
-            if (!chunks.empty() && chunks.back().address + chunks.back().data.size() == fullAddr) chunks.back().data.insert(chunks.back().data.end(), d.begin(), d.end());
+            if (!chunks.empty() && chunks.back().address + chunks.back().data.size() == fullAddr) 
+                chunks.back().data.insert(chunks.back().data.end(), d.begin(), d.end());
             else chunks.push_back({fullAddr, d});
-        } else if (type == 0x04) { baseAddr = (hstob(line.substr(9, 2)) << 24) | (hstob(line.substr(11, 2)) << 16); }
+        } else if (type == 0x04) { 
+            baseAddr = (hstob(line.substr(9, 2)) << 24) | (hstob(line.substr(11, 2)) << 16); 
+        }
     }
     file.close();
-    std::cout << "[ENGINE] Parsing complete. Total Sections: " << chunks.size() << std::endl;
 
     int sock = socket(AF_INET, SOCK_STREAM, 0);
-
-    struct timeval tv;
-    tv.tv_sec = 3;
-    tv.tv_usec = 0;
+    struct timeval tv; tv.tv_sec = 3; tv.tv_usec = 0;
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
 
     struct sockaddr_in serv_addr;
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_port = htons(DOIP_PORT);
     inet_pton(AF_INET, gatewayIp.c_str(), &serv_addr.sin_addr);
 
-    std::cout << "[DOIP] Attempting TCP Connect to " << gatewayIp << "..." << std::endl;
     if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
         std::cerr << "[DOIP] TCP Connection Failed!" << std::endl;
         return -1;
     }
-    std::cout << "[DOIP] TCP Connected. Sending Routing Activation..." << std::endl;
-
     if (!routingActivation(sock)) {
-        std::cerr << "[DOIP] Routing Activation Failed (No Response)!" << std::endl;
-        close(sock);
-        return -1;
+        std::cerr << "[DOIP] Routing Activation Failed!" << std::endl;
+        close(sock); return -1;
     }
 
+    std::cout << "\n[INSTALL Phase] Executing Flashing via UDS..." << std::endl;
     int nrc;
-    if ((nrc = enterProgrammingSession(sock, targetAddr)) != 0) { close(sock); return nrc; }
-
     for (size_t i = 0; i < chunks.size(); ++i) {
         auto& chunk = chunks[i];
-        std::cout << "\n--- Processing Section [" << i+1 << "/" << chunks.size() << "] ---" << std::endl;
-        
         if ((nrc = requestDownload(sock, targetAddr, chunk.address, chunk.data.size())) != 0) { close(sock); return nrc; }
-        if (chunk.data.empty()) {
-            std::cout << "   [WARN] Section has no data. Skipping 0x36 transfer." << std::endl;
-        } else {
-            std::cout << "   [UDS] Starting 0x36 transfer. Total: " << chunk.data.size() << " bytes." << std::endl;
-        }
+        
         uint8_t sn = 1;
         uint32_t offset = 0;
         while (offset < chunk.data.size()) {
@@ -175,7 +176,6 @@ int startOtaTransfer(const std::string& targetAddrStr, const std::string& versio
             udsPayload.insert(udsPayload.end(), chunk.data.begin() + offset, chunk.data.begin() + offset + currLen);
             
             sendUdsPacket(sock, targetAddr, 0x36, udsPayload);
-            
             uint8_t res_buf[1500];
             int rLen = recv(sock, res_buf, sizeof(res_buf), 0);
             int transferRes = checkUdsResponse(res_buf, rLen, 0x76);
@@ -183,18 +183,39 @@ int startOtaTransfer(const std::string& targetAddrStr, const std::string& versio
             if (transferRes == 0) {
                 offset += currLen;
                 sn = (sn == 0xFF) ? 0x00 : sn + 1;
-                if (offset % 5120 == 0) std::cout << "   [UDS] Transmitting... (" << offset << "/" << chunk.data.size() << " bytes)" << std::endl;
-            } else {
-                std::cerr << "   [ERROR] 0x36 failed at offset " << offset << std::endl;
-                close(sock); return transferRes;
-            }
+            } else { close(sock); return transferRes; }
         }
         if ((nrc = exitTransfer(sock, targetAddr)) != 0) { close(sock); return nrc; }
+        
         uint32_t checksum = calculateChunkChecksum(chunk.data);
         if ((nrc = verifyIntegrity(sock, targetAddr, checksum)) != 0) { close(sock); return nrc; }
     }
 
-    std::cout << "\n✅ [ENGINE] All Sections Transferred and Verified Successfully!" << std::endl;
+    std::cout << "\n✅ Data flashing completed in background." << std::endl;
+
+    // State 8: WAIT_ACTIVATION
+    stateCallback(OtaState::WAIT_ACTIVATION);
+    std::cout << "\n[WAIT] Please stop the vehicle and turn off the engine for update activation." << std::endl;
+    std::cout << "[SIMULATION] Press Enter to simulate 'Vehicle Stopped' condition..." << std::endl;
+    std::cin.ignore(); 
+
+    if ((nrc = enterProgrammingSession(sock, targetAddr)) != 0) {
+        std::cerr << "[ERROR] Could not enter Programming Session for Activation." << std::endl;
+        close(sock); return nrc;
+    }
+
+    // State 9: ACTIVATION
+    stateCallback(OtaState::ACTIVATION);
+    int swapResult = requestBankSwap(sock, targetAddr);
+
+    if (swapResult != 0) {
+        // State 10: RECOVERY (뱅크 스왑 시퀀스 실패 차단 예외처리 연동)
+        stateCallback(OtaState::RECOVERY);
+        std::cerr << "⚠️ [RECOVERY] Critical error during bank swap. Rolling back to original stable bank system..." << std::endl;
+        close(sock);
+        return swapResult;
+    }
+
     close(sock);
     return 0;
 }
