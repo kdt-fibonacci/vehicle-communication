@@ -147,6 +147,21 @@ void executeUpdate(const std::string& addr, const std::string& ver, const std::s
     std::cout << "\n----------------------------------------" << std::endl;
     std::cout << ">> [OTA Engine] Processing ECU 0x" << addr << " v" << ver << std::endl;
 
+    // 💡 [개선 포인트] DOWNLOAD 상태로 가기 전 사용자의 수락 여부를 점검하는 블로킹 필터
+    std::cout << "\n [USER PROMPT] ota 새로운 업데이트 파일이 있습니다." << std::endl;
+    std::cout << " 업데이트를 하시겠습니까? (y/n) [기본값: y]: ";
+    
+    std::string userInput;
+    std::getline(std::cin, userInput);
+
+    // 사용자가 'n' 또는 'N'을 누르면 업데이트 세션을 취소하고 대기 상태로 이탈
+    if (userInput == "n" || userInput == "N") {
+        std::cout << " [OTA Engine] Update canceled by user. Returning to monitor mode." << std::endl;
+        changeState(OtaState::WAIT);
+        std::cout << "----------------------------------------" << std::endl;
+        return;
+    }
+
     // State 5: DOWNLOAD
     changeState(OtaState::DOWNLOAD);
     reportStatusToServer(addr, ver, "DOWNLOADING");
@@ -161,7 +176,7 @@ void executeUpdate(const std::string& addr, const std::string& ver, const std::s
         return;
     }
 
-    // State 6: VERIFICATION (구현부가 오염되지 않도록 ota_security.cpp의 외부 함수만 깨끗하게 호출)
+    // State 6: VERIFICATION
     changeState(OtaState::VERIFICATION);
     if (!verifyFirmwareSecurity(addr, ver, LOCAL_PUBLIC_KEY_PATH)) {
         changeState(OtaState::REPORTING);
