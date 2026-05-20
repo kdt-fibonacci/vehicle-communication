@@ -1,0 +1,12 @@
+{
+    "ecus": [
+        {
+            "address": "1234",
+            "version": "1.0"
+        },
+        {
+            "address": "5678",
+            "version": "1.0"
+        }
+    ]
+}
