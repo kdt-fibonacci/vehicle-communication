@@ -11,37 +11,19 @@
 #include <iomanip>
 #include <sstream>
 
+extern "C" {
+    #include "state.h"
+}
+
 using json = nlohmann::json;
 
-// --- [상태 머신 정의] ---
-enum class OtaState {
-    OFF,
-    IDLE,
-    WAIT,
-    READY,
-    DOWNLOAD,
-    VERIFICATION,
-    INSTALL,
-    WAIT_ACTIVATION,
-    ACTIVATION,
-    RECOVERY,
-    REPORTING
-};
+extern STATE current_state;
+extern STATE prev_state;
 
-const std::string StateStrings[] = {
-    "OFF", "IDLE", "WAIT", "READY", "DOWNLOAD", "VERIFICATION", 
-    "INSTALL", "WAIT_ACTIVATION", "ACTIVATION", "RECOVERY", "REPORTING"
-};
+extern int current_progress;
 
-OtaState currentOtaState = OtaState::OFF;
-
-void changeState(OtaState newState) {
-    std::cout << "\n==================================================" << std::endl;
-    std::cout << "[STATE CHANGED] " << StateStrings[static_cast<int>(currentOtaState)] 
-              << " ➡️ " << StateStrings[static_cast<int>(newState)] << std::endl;
-    std::cout << "==================================================" << std::endl;
-    currentOtaState = newState;
-}
+extern char update_ecu_name[16];
+extern char update_ecu_version[16];
 
 struct EcuVersion {
     std::string address;
@@ -49,8 +31,8 @@ struct EcuVersion {
 };
 
 const std::string VERSION_FILE = "./ecu_versions.json";
-const std::string CHECK_URL = "http://192.168.200.135:4321/ota/check";
-const std::string REPORT_URL = "http://192.168.200.135:4321/ota/report";
+const std::string CHECK_URL = "http://192.168.203.234:4321/ota/check";
+const std::string REPORT_URL = "http://192.168.203.234:4321/ota/report";
 const std::string MQTT_ADDRESS = "tcp://192.168.200.135:1883";
 const std::string CLIENT_ID = "RPi_OTA_Client";
 const std::string TOPIC = "ota/update";
@@ -60,7 +42,7 @@ const std::string GATEWAY_IP = "192.168.1.20";
 
 // --- 외부 모듈 함수 순수 참조 선언 ---
 extern bool verifyFirmwareSecurity(const std::string& addr, const std::string& version, const std::string& publicKeyPath);
-extern int startOtaTransfer(const std::string& targetAddrStr, const std::string& version, const std::string& gatewayIp, void (*stateCallback)(OtaState));
+extern int startOtaTransfer(const std::string& targetAddrStr, const std::string& version, const std::string& gatewayIp);
 
 std::string toHexStr(int val) {
     std::stringstream ss;
@@ -144,55 +126,90 @@ void saveLocalVersion(const std::string& addr, const std::string& new_ver) {
 }
 
 void executeUpdate(const std::string& addr, const std::string& ver, const std::string& f_url, const std::string& s_url) {
-    std::cout << "\n----------------------------------------" << std::endl;
-    std::cout << ">> [OTA Engine] Processing ECU 0x" << addr << " v" << ver << std::endl;
+    /* ========================= */
+    /* LCD 표시용 정보 설정 */
+    /* ========================= */
+    strncpy(
+        update_ecu_name,
+        addr.c_str(),
+        sizeof(update_ecu_name) - 1
+    );
 
-    // 💡 [개선 포인트] DOWNLOAD 상태로 가기 전 사용자의 수락 여부를 점검하는 블로킹 필터
-    std::cout << "\n [USER PROMPT] ota 새로운 업데이트 파일이 있습니다." << std::endl;
-    std::cout << " 업데이트를 하시겠습니까? (y/n) [기본값: y]: ";
+    update_ecu_name[
+        sizeof(update_ecu_name) - 1
+    ] = '\0';
+
+    strncpy(
+        update_ecu_version,
+        ver.c_str(),
+        sizeof(update_ecu_version) - 1
+    );
+
+    update_ecu_version[
+        sizeof(update_ecu_version) - 1
+    ] = '\0';
     
-    std::string userInput;
-    std::getline(std::cin, userInput);
+    /* ========================= */
+    /* 상태 변경 및 승인 대기  */
+    /* ========================= */
+    current_state = READY;
 
-    // 사용자가 'n' 또는 'N'을 누르면 업데이트 세션을 취소하고 대기 상태로 이탈
-    if (userInput == "n" || userInput == "N") {
-        std::cout << " [OTA Engine] Update canceled by user. Returning to monitor mode." << std::endl;
-        changeState(OtaState::WAIT);
-        std::cout << "----------------------------------------" << std::endl;
+    while (current_state == READY)
+    {
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(100)
+        );
+    }
+
+    /* 사용자가 NO 선택 */
+
+    if (current_state == PENDING)
+    {
+        current_state = WAIT;
+
         return;
     }
 
-    // State 5: DOWNLOAD
-    changeState(OtaState::DOWNLOAD);
+    
+    /* ========================= */
+    /* DOWNLOAD */
+    /* ========================= */
+    current_state = DOWNLOAD;
     reportStatusToServer(addr, ver, "DOWNLOADING");
 
     std::string hex_file = addr + "_" + ver + ".hex";
     std::string sig_file = addr + "_" + ver + ".sig";
-
+    current_progress = 0;
     if (!downloadFile(f_url, hex_file) || !downloadFile(s_url, sig_file)) {
-        changeState(OtaState::REPORTING);
+        current_state = REPORTING;
         reportStatusToServer(addr, ver, "FAILED", "0xFF");
-        changeState(OtaState::WAIT);
+        current_state = WAIT;
         return;
     }
+    current_progress = 100;
 
-    // State 6: VERIFICATION
-    changeState(OtaState::VERIFICATION);
+    /* ========================= */
+    /* VERIFICATION */
+    /* ========================= */
+    current_state = VERIFICATION;
+
     if (!verifyFirmwareSecurity(addr, ver, LOCAL_PUBLIC_KEY_PATH)) {
-        changeState(OtaState::REPORTING);
+        current_state = REPORTING;
         reportStatusToServer(addr, ver, "AUTH_FAILED");
-        changeState(OtaState::WAIT);
+        current_state = WAIT;
         return;
     }
 
-    // State 7: INSTALL
-    changeState(OtaState::INSTALL);
+    /* ========================= */
+    /* INSTALL */
+    /* ========================= */
+    current_state = INSTALL;
     reportStatusToServer(addr, ver, "FLASHING");
     
-    int result = startOtaTransfer(addr, ver, GATEWAY_IP, changeState);
+    int result = startOtaTransfer(addr, ver, GATEWAY_IP);
 
     // State 11: REPORTING
-    changeState(OtaState::REPORTING);
+    current_state = REPORTING;
     if (result == 0) {
         std::cout << "✅ [Success] Update sequence finished!" << std::endl;
         reportStatusToServer(addr, ver, "SUCCESS");
@@ -203,7 +220,7 @@ void executeUpdate(const std::string& addr, const std::string& ver, const std::s
         reportStatusToServer(addr, ver, "FAILED", nrc_hex);
     }
     
-    changeState(OtaState::WAIT);
+    current_state = WAIT;
     std::cout << "----------------------------------------" << std::endl;
 }
 
@@ -233,7 +250,7 @@ void performInitialSync() {
             auto res_json = json::parse(response_string);
             for (const auto& update : res_json["updates"]) {
                 if (update.value("update", false)) {
-                    changeState(OtaState::READY); // State 4: READY
+                    current_state = READY; // State 4: READY
                     executeUpdate(update["address"], update["version"], 
                                   update["firmware_url"], update["signature_url"]);
                 }
@@ -265,7 +282,6 @@ class ota_callback : public virtual mqtt::callback {
                     }
                 }
                 
-                changeState(OtaState::READY); // State 4: READY
                 executeUpdate(addr, ver, data["firmware_url"], data["signature_url"]);
             }
         } catch (const std::exception& e) {
@@ -279,12 +295,12 @@ class ota_callback : public virtual mqtt::callback {
 };
 
 void runOtaService() {
-    changeState(OtaState::IDLE); // State 2: IDLE
+    current_state = IDLE; // State 2: IDLE
     curl_global_init(CURL_GLOBAL_ALL);
 
     performInitialSync();
 
-    changeState(OtaState::WAIT); // State 3: WAIT
+    current_state = WAIT; // State 3: WAIT
     try {
         mqtt::async_client client(MQTT_ADDRESS, CLIENT_ID);
         ota_callback cb;

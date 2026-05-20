@@ -9,13 +9,14 @@
 #include <string>
 #include <iomanip>
 
+extern "C" {
+    #include "state.h"
+}
+
+extern STATE current_state;
+
 const int DOIP_PORT = 13400;
 const uint16_t RPI_SA = 0x0E00; 
-
-enum class OtaState {
-    OFF, IDLE, WAIT, READY, DOWNLOAD, VERIFICATION, 
-    INSTALL, WAIT_ACTIVATION, ACTIVATION, RECOVERY, REPORTING
-};
 
 struct DataChunk {
     uint32_t address;
@@ -116,7 +117,7 @@ int requestBankSwap(int sock, uint16_t targetAddr) {
     return checkUdsResponse(res, len, 0x71);
 }
 
-int startOtaTransfer(const std::string& targetAddrStr, const std::string& version, const std::string& gatewayIp, void (*stateCallback)(OtaState)) {
+int startOtaTransfer(const std::string& targetAddrStr, const std::string& version, const std::string& gatewayIp) {
     uint16_t targetAddr = (uint16_t)std::stoul(targetAddrStr, nullptr, 16);
     std::string hexPath = targetAddrStr + "_" + version + ".hex";
     
@@ -194,7 +195,7 @@ int startOtaTransfer(const std::string& targetAddrStr, const std::string& versio
     std::cout << "\n✅ Data flashing completed in background." << std::endl;
 
     // State 8: WAIT_ACTIVATION
-    stateCallback(OtaState::WAIT_ACTIVATION);
+    current_state = WAIT_ACTIVATION;
     std::cout << "\n[WAIT] Please stop the vehicle and turn off the engine for update activation." << std::endl;
     std::cout << "[SIMULATION] Press Enter to simulate 'Vehicle Stopped' condition..." << std::endl;
     std::cin.ignore(); 
@@ -205,12 +206,12 @@ int startOtaTransfer(const std::string& targetAddrStr, const std::string& versio
     }
 
     // State 9: ACTIVATION
-    stateCallback(OtaState::ACTIVATION);
+    current_state = ACTIVATION;
     int swapResult = requestBankSwap(sock, targetAddr);
 
     if (swapResult != 0) {
         // State 10: RECOVERY (뱅크 스왑 시퀀스 실패 차단 예외처리 연동)
-        stateCallback(OtaState::RECOVERY);
+        current_state = RECOVERY;
         std::cerr << "⚠️ [RECOVERY] Critical error during bank swap. Rolling back to original stable bank system..." << std::endl;
         close(sock);
         return swapResult;
