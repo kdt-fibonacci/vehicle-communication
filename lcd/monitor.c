@@ -32,8 +32,8 @@ MENU_STATE prev_menu    = -1;
 int current_progress = 0;
 int prev_progress    = -1;
 
-char update_ecu_name[16]    = "MOTOR";
-char update_ecu_version[16] = "1.2";
+char update_ecu_name[16];
+char update_ecu_version[16];
 
 /* ========================= */
 /* 화면 렌더 */
@@ -57,7 +57,7 @@ void render_screen()
 
         case READY: // 업데이트 준비 중 (예 /아니오 선택)
 
-            lcd_update_screen(
+            lcd_ready_screen(
                 update_ecu_name,
                 update_ecu_version,
                 current_menu == MENU_YES
@@ -67,15 +67,13 @@ void render_screen()
 
         case PENDING: // 업데이트 대기 중 (READY에서 아니오를 누름)
 
-            lcd_ready_screen();
+            lcd_pending_screen();
 
             break;
 
         case DOWNLOAD:
 
-            lcd_downloading_screen(
-                current_progress
-            );
+            lcd_downloading_screen(current_progress);
 
             break;
 
@@ -138,22 +136,20 @@ void enter_button_interrupt()
     if (current_state == PENDING)
     {
         current_state = READY;
-
-        return;
     }
 
-    if (current_state != READY)
-        return;
-
-    if (current_menu == MENU_YES)
+    else if (current_state == READY)
     {
-        current_state = DOWNLOAD;
-    }
-    else
-    {
-        current_state = PENDING;
+        if (current_menu == MENU_YES)
+        {
+            current_state = DOWNLOAD;
+        }
+        else // current_menu == MENU_NO
+        {
+            current_state = PENDING;
 
-        current_menu = MENU_YES;
+            current_menu = MENU_YES;
+        }
     }
 }
 
@@ -196,8 +192,6 @@ void* lcd_thread(void* arg)
         &enter_button_interrupt
     );
 
-    /* 초기 화면 */
-    current_state = IDLE;
 
     render_screen();
 

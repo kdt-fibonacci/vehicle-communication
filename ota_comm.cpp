@@ -10,12 +10,15 @@
 #include <chrono>
 #include <iomanip>
 #include <sstream>
+#include <mutex>
 
-extern "C" {
-    #include "state.h"
-}
+#include "state.h"
+#include "struct.h"
+
 
 using json = nlohmann::json;
+
+std::mutex queue_mutex;
 
 extern STATE current_state;
 extern STATE prev_state;
@@ -25,6 +28,8 @@ extern int current_progress;
 extern char update_ecu_name[16];
 extern char update_ecu_version[16];
 
+extern std::queue<UpdateItem> update_queue;
+
 struct EcuVersion {
     std::string address;
     std::string version;
@@ -33,7 +38,7 @@ struct EcuVersion {
 const std::string VERSION_FILE = "./ecu_versions.json";
 const std::string CHECK_URL = "http://192.168.203.234:4321/ota/check";
 const std::string REPORT_URL = "http://192.168.203.234:4321/ota/report";
-const std::string MQTT_ADDRESS = "tcp://192.168.200.135:1883";
+const std::string MQTT_ADDRESS = "tcp://192.168.203.234:1883";
 const std::string CLIENT_ID = "RPi_OTA_Client";
 const std::string TOPIC = "ota/update";
 const std::string DEVICE_ID = "0001";
@@ -129,25 +134,13 @@ void executeUpdate(const std::string& addr, const std::string& ver, const std::s
     /* ========================= */
     /* LCD 표시용 정보 설정 */
     /* ========================= */
-    strncpy(
-        update_ecu_name,
-        addr.c_str(),
-        sizeof(update_ecu_name) - 1
-    );
+    strncpy(update_ecu_name, addr.c_str(), sizeof(update_ecu_name) - 1);
 
-    update_ecu_name[
-        sizeof(update_ecu_name) - 1
-    ] = '\0';
+    update_ecu_name[sizeof(update_ecu_name) - 1] = '\0';
 
-    strncpy(
-        update_ecu_version,
-        ver.c_str(),
-        sizeof(update_ecu_version) - 1
-    );
+    strncpy(update_ecu_version, ver.c_str(), sizeof(update_ecu_version) - 1);
 
-    update_ecu_version[
-        sizeof(update_ecu_version) - 1
-    ] = '\0';
+    update_ecu_version[sizeof(update_ecu_version) - 1] = '\0';
     
     /* ========================= */
     /* 상태 변경 및 승인 대기  */
@@ -156,34 +149,26 @@ void executeUpdate(const std::string& addr, const std::string& ver, const std::s
 
     while (current_state == READY)
     {
-        std::this_thread::sleep_for(
-            std::chrono::milliseconds(100)
-        );
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
     /* 사용자가 NO 선택 */
-
     if (current_state == PENDING)
     {
-        current_state = WAIT;
-
         return;
     }
-
     
     /* ========================= */
     /* DOWNLOAD */
     /* ========================= */
     current_state = DOWNLOAD;
     reportStatusToServer(addr, ver, "DOWNLOADING");
-
     std::string hex_file = addr + "_" + ver + ".hex";
     std::string sig_file = addr + "_" + ver + ".sig";
     current_progress = 0;
     if (!downloadFile(f_url, hex_file) || !downloadFile(s_url, sig_file)) {
         current_state = REPORTING;
         reportStatusToServer(addr, ver, "FAILED", "0xFF");
-        current_state = WAIT;
         return;
     }
     current_progress = 100;
@@ -196,7 +181,6 @@ void executeUpdate(const std::string& addr, const std::string& ver, const std::s
     if (!verifyFirmwareSecurity(addr, ver, LOCAL_PUBLIC_KEY_PATH)) {
         current_state = REPORTING;
         reportStatusToServer(addr, ver, "AUTH_FAILED");
-        current_state = WAIT;
         return;
     }
 
@@ -219,8 +203,7 @@ void executeUpdate(const std::string& addr, const std::string& ver, const std::s
         std::cerr << "❌ [Error] Failed with NRC: " << nrc_hex << std::endl;
         reportStatusToServer(addr, ver, "FAILED", nrc_hex);
     }
-    
-    current_state = WAIT;
+
     std::cout << "----------------------------------------" << std::endl;
 }
 
@@ -250,9 +233,14 @@ void performInitialSync() {
             auto res_json = json::parse(response_string);
             for (const auto& update : res_json["updates"]) {
                 if (update.value("update", false)) {
-                    current_state = READY; // State 4: READY
-                    executeUpdate(update["address"], update["version"], 
-                                  update["firmware_url"], update["signature_url"]);
+                    // 업데이트할 목록이 있으면 Queue에 넣기
+                    queue_mutex.lock();
+                    update_queue.push({update["address"], update["version"], update["firmware_url"], update["signature_url"]});
+                    queue_mutex.unlock();
+
+                    current_state = READY;
+
+                    //executeUpdate(update["addr"], update["ver"], update["firware_url"], update["signature_url"]);
                 }
             }
         } catch (const std::exception& e) {
@@ -281,8 +269,14 @@ class ota_callback : public virtual mqtt::callback {
                         return;
                     }
                 }
-                
-                executeUpdate(addr, ver, data["firmware_url"], data["signature_url"]);
+                // 업데이트할 목록이 생으면 Queue에 넣기
+                queue_mutex.lock();
+                update_queue.push({addr, ver, data["firmware_url"], data["signature_url"]});
+                queue_mutex.unlock();
+
+                current_state = READY;
+
+                //executeUpdate(update["addr"], update["ver"], update["firmware_url"], update["signature_url"]);
             }
         } catch (const std::exception& e) {
             std::cerr << "[Error] MQTT Payload Parse Error: " << e.what() << std::endl;
@@ -323,4 +317,63 @@ void runOtaService() {
         std::cerr << "[MQTT Critical] Error: " << e.what() << std::endl;
     }
     curl_global_cleanup();
+}
+
+// 업데이트 큐 검사하며 업데이트 지시를 내리는 스레드 함수
+void* ota_worker_thread(void* arg)
+{
+    while (true)
+    {
+        if(current_state == PENDING) continue;
+        queue_mutex.lock();
+
+        if (update_queue.empty())
+        {
+            queue_mutex.unlock();
+
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(1000)
+            );
+
+            continue;
+        }
+
+        UpdateItem item = update_queue.front();
+
+        queue_mutex.unlock();
+
+        executeUpdate(item.addr, item.ver, item.firmware_url, item.signature_url);
+
+        // 사용자가 NO 누른 경우
+        if (current_state == PENDING)
+        {
+            std::this_thread::sleep_for(
+                std::chrono::seconds(1)
+            );
+            
+            queue_mutex.lock();
+            update_queue.pop();
+            update_queue.push({item.addr, item.ver, item.firmware_url, item.signature_url});
+            queue_mutex.unlock();
+            
+            continue;
+        }
+
+        // 성공/실패 완료된 경우만 제거
+        queue_mutex.lock();
+
+        if (!update_queue.empty())
+        {
+            update_queue.pop();
+        }
+
+        queue_mutex.unlock();
+
+        if (update_queue.empty())
+            current_state = WAIT;
+        else
+            current_state = PENDING;
+    }
+
+    return NULL;
 }

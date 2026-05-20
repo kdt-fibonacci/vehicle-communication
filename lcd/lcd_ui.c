@@ -14,7 +14,7 @@ void lcd_idle_screen()
     lcd_print("EVENT WAITING");
 }
 
-void lcd_ready_screen()
+void lcd_pending_screen()
 {
     lcd_clear();
 
@@ -25,7 +25,7 @@ void lcd_ready_screen()
     lcd_print("PRESS ENTER");
 }
 
-void lcd_update_screen(
+void lcd_ready_screen(
     const char* ecu_name,
     const char* version,
     int yes_selected

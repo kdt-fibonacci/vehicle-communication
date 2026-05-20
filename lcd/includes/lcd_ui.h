@@ -3,9 +3,9 @@
 
 void lcd_idle_screen();
 
-void lcd_ready_screen();
+void lcd_pending_screen();
 
-void lcd_update_screen(
+void lcd_ready_screen(
     const char* ecu_name,
     const char* version,
     int yes_selected
