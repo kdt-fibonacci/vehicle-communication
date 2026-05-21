@@ -124,7 +124,7 @@ int startOtaTransfer(const std::string& targetAddrStr, const std::string& versio
     if (!file.is_open()) { std::cerr << "[ERROR] Cannot open HEX file." << std::endl; return -1; }
 
     return 0; // 임시로 바로 통과되도록
-
+    
     std::vector<DataChunk> chunks;
     uint32_t baseAddr = 0; std::string line;
     while (std::getline(file, line)) {

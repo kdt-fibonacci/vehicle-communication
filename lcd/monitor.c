@@ -2,6 +2,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <wiringPi.h>
+#include <sys/time.h>
 
 #include "monitor.h"
 #include "lcd_i2c_driver.h"
@@ -18,6 +19,10 @@
 
 extern STATE current_state;
 extern STATE prev_state;
+
+static unsigned int last_left_time  = 0;
+static unsigned int last_right_time = 0;
+static unsigned int last_enter_time = 0;
 
 typedef enum
 {
@@ -117,6 +122,18 @@ void render_screen()
 
 void left_button_interrupt()
 {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+
+    unsigned int now = tv.tv_sec * 1000 + tv.tv_usec / 1000;
+
+    // 200ms 이내 중복 입력 무시
+    if (now - last_left_time < 200)
+        return;
+
+    last_left_time = now;
+
+    puts("LEFT");
     if (current_state != READY)
         return;
 
@@ -125,6 +142,18 @@ void left_button_interrupt()
 
 void right_button_interrupt()
 {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+
+    unsigned int now = tv.tv_sec * 1000 + tv.tv_usec / 1000;
+
+    // 200ms 이내 중복 입력 무시
+    if (now - last_right_time < 200)
+        return;
+
+    last_right_time = now;
+
+    puts("RIGHT");
     if (current_state != READY)
         return;
 
@@ -133,6 +162,19 @@ void right_button_interrupt()
 
 void enter_button_interrupt()
 {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+
+    unsigned int now = tv.tv_sec * 1000 + tv.tv_usec / 1000;
+
+    // 200ms 이내 중복 입력 무시
+    if (now - last_enter_time < 200)
+        return;
+
+    last_enter_time = now;
+
+    puts("ENTER");
+
     if (current_state == PENDING)
     {
         current_state = READY;
