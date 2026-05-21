@@ -36,9 +36,9 @@ struct EcuVersion {
 };
 
 const std::string VERSION_FILE = "./ecu_versions.json";
-const std::string CHECK_URL = "http://192.168.203.234:4321/ota/check";
-const std::string REPORT_URL = "http://192.168.203.234:4321/ota/report";
-const std::string MQTT_ADDRESS = "tcp://192.168.203.234:1883";
+const std::string CHECK_URL = "http://192.168.202.103:4321/ota/check";
+const std::string REPORT_URL = "http://192.168.202.103:4321/ota/report";
+const std::string MQTT_ADDRESS = "tcp://192.168.202.103:1883";
 const std::string CLIENT_ID = "RPi_OTA_Client";
 const std::string TOPIC = "ota/update";
 const std::string DEVICE_ID = "0001";
@@ -165,7 +165,7 @@ void executeUpdate(const std::string& addr, const std::string& ver, const std::s
     reportStatusToServer(addr, ver, "DOWNLOADING");
     std::string hex_file = addr + "_" + ver + ".hex";
     std::string sig_file = addr + "_" + ver + ".sig";
-    current_progress = 0;
+    current_progress = 0; // 다운로드 값 넣어주기
     if (!downloadFile(f_url, hex_file) || !downloadFile(s_url, sig_file)) {
         current_state = REPORTING;
         reportStatusToServer(addr, ver, "FAILED", "0xFF");

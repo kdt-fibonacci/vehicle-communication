@@ -8,6 +8,7 @@
 #include <cstring>
 #include <string>
 #include <iomanip>
+#include <thread> 
 
 #include "state.h"
 
@@ -79,6 +80,16 @@ int enterProgrammingSession(int sock, uint16_t targetAddr) {
     return checkUdsResponse(res, len, 0x50);
 }
 
+int changeDiagnosticSession(int sock, uint16_t targetAddr, uint8_t sessionType) {
+    std::string sessionName = (sessionType == 0x02) ? "Programming Session (0x02)" : "Extended Session (0x03)";
+    std::cout << "[UDS] Requesting Session Switch to " << sessionName << "..." << std::endl;
+    
+    sendUdsPacket(sock, targetAddr, 0x10, { sessionType });
+    uint8_t res[64];
+    int len = recv(sock, res, sizeof(res), 0);
+    return checkUdsResponse(res, len, 0x50);
+}
+
 int requestDownload(int sock, uint16_t targetAddr, uint32_t addr, uint32_t size) {
     std::cout << "[UDS] Requesting Download (0x34) to Addr: 0x" << std::hex << addr << std::dec << std::endl;
     std::vector<uint8_t> p = { 0x00, 0x44, (uint8_t)(addr >> 24), (uint8_t)(addr >> 16), (uint8_t)(addr >> 8), (uint8_t)addr, (uint8_t)(size >> 24), (uint8_t)(size >> 16), (uint8_t)(size >> 8), (uint8_t)size };
@@ -123,7 +134,7 @@ int startOtaTransfer(const std::string& targetAddrStr, const std::string& versio
     std::ifstream file(hexPath);
     if (!file.is_open()) { std::cerr << "[ERROR] Cannot open HEX file." << std::endl; return -1; }
 
-    return 0; // 임시로 바로 통과되도록
+    // return 0; // 임시로 바로 통과되도록
 
     std::vector<DataChunk> chunks;
     uint32_t baseAddr = 0; std::string line;
@@ -165,6 +176,12 @@ int startOtaTransfer(const std::string& targetAddrStr, const std::string& versio
 
     std::cout << "\n[INSTALL Phase] Executing Flashing via UDS..." << std::endl;
     int nrc;
+
+    if ((nrc = changeDiagnosticSession(sock, targetAddr, 0x03)) != 0) {
+        std::cerr << "[ERROR] Failed to enter Extended Session (0x03)" << std::endl;
+        close(sock); return nrc;
+    }
+
     for (size_t i = 0; i < chunks.size(); ++i) {
         auto& chunk = chunks[i];
         if ((nrc = requestDownload(sock, targetAddr, chunk.address, chunk.data.size())) != 0) { close(sock); return nrc; }
@@ -195,28 +212,57 @@ int startOtaTransfer(const std::string& targetAddrStr, const std::string& versio
     std::cout << "\n✅ Data flashing completed in background." << std::endl;
 
     // State 8: WAIT_ACTIVATION
-    current_state = WAIT_ACTIVATION;
-    std::cout << "\n[WAIT] Please stop the vehicle and turn off the engine for update activation." << std::endl;
-    std::cout << "[SIMULATION] Press Enter to simulate 'Vehicle Stopped' condition..." << std::endl;
-    std::cin.ignore(); 
+current_state = WAIT_ACTIVATION; // state.h 전역 변수 동기화
+    
+    bool safeStateAchieved = false;
+    int retryCounter = 0;
+    const int MAX_RETRIES = 120; // 3초 간격으로 최대 120번 수행 = 총 6분 대기
 
-    if ((nrc = enterProgrammingSession(sock, targetAddr)) != 0) {
-        std::cerr << "[ERROR] Could not enter Programming Session for Activation." << std::endl;
-        close(sock); return nrc;
+    std::cout << "\n[WAIT] Vehicle data verified. Monitoring vehicle for Safe State (Stop & Gear P)..." << std::endl;
+
+    while (!safeStateAchieved && retryCounter < MAX_RETRIES) {
+        // Programming Session(0x10 02) 권한 격상 요청을 통한 정차 상태 감지 폴링
+        nrc = changeDiagnosticSession(sock, targetAddr, 0x02);
+
+        if (nrc == 0) {
+            // ① 대기 탈출 성공: ECU가 수락(0x50)함 -> 차가 완벽히 안전 정차 상태 도달!
+            std::cout << "✅ [UDS] Safe State Confirmed by ECU. Programming Session (0x10 02) Opened!" << std::endl;
+            safeStateAchieved = true;
+        } 
+        else if (nrc == 0x22) {
+            // ② 대기 유지: ECU가 거부(0x7F 10 22 ConditionsNotCorrect)함 -> 차가 아직 주행 중임!
+            std::cout << "⚠️ [UDS] ECU Response: Conditions Not Correct (0x22). Vehicle is moving. Retrying in 3 seconds... [" 
+                      << retryCounter + 1 << "/" << MAX_RETRIES << "]" << std::endl;
+            
+            retryCounter++;
+            std::this_thread::sleep_for(std::chrono::seconds(3)); // 소켓 유지한 채 3초 대기
+        } 
+        else {
+            // ③ 치명적 에러: 다른 규격 에러 발생 시 기능안전(Functional Safety)을 위해 탈출 및 예외처리
+            std::cerr << "❌ [CRITICAL] Unexpected UDS Session Error: 0x" << std::hex << nrc << std::dec << std::endl;
+            close(sock); return nrc;
+        }
     }
 
-    // State 9: ACTIVATION
-    current_state = ACTIVATION;
+    // 타임아웃 예외 처리 (장시간 주행으로 정차하지 않은 경우 활성화 연기)
+    if (!safeStateAchieved) {
+        std::cerr << "❌ [TIMEOUT] Vehicle did not enter safe state within timeout. Postponing activation." << std::endl;
+        close(sock); 
+        return 0x22; // 호출부 상위 레이어로 거부 코드 반환하여 주행 우선순위 보장
+    }
+
+    // 4단계: 최고 보안 등급(0x10 02) 도달 확인 후 원자적 A/B 뱅크 스왑 최종 실행
+    current_state = ACTIVATION; // state.h 전역 변수 동기화
     int swapResult = requestBankSwap(sock, targetAddr);
 
     if (swapResult != 0) {
-        // State 10: RECOVERY (뱅크 스왑 시퀀스 실패 차단 예외처리 연동)
+        // 리커버리 상태 진입 (뱅크 스왑 시퀀스 실패 시 기존 오리지널 뱅크 유지)
         current_state = RECOVERY;
-        std::cerr << "⚠️ [RECOVERY] Critical error during bank swap. Rolling back to original stable bank system..." << std::endl;
-        close(sock);
-        return swapResult;
+        std::cerr << "⚠️ [RECOVERY] Critical error during bank swap. Rolled back to stable bank." << std::endl;
+        close(sock); return swapResult;
     }
 
+    std::cout << "🚀 [SUCCESS] Bank swap command accepted. Target ECU is rebooting with new firmware..." << std::endl;
     close(sock);
     return 0;
 }
