@@ -440,7 +440,7 @@ void* ota_worker_thread(void* arg)
             }
         }
 
-        // 💡 구버전이거나 이미 반영된 동일 버전이면 사용자를 귀찮게 하지 않고 큐에서 즉시 무소음 삭제(pop)
+        // 구버전이거나 이미 반영된 동일 버전이면 큐에서 즉시 무소음 삭제(pop)
         if (isInvalidVersion) {
             queue_mutex.lock();
             if (!update_queue.empty() && update_queue.front().addr == item.addr) {
