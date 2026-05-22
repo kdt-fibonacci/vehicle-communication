@@ -6,6 +6,7 @@
 #include <nlohmann/json.hpp>
 #include <curl/curl.h>
 #include <mqtt/async_client.h>
+#include <sys/stat.h>
 #include <thread>
 #include <chrono>
 #include <iomanip>
@@ -61,16 +62,29 @@ static size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* use
     return realsize;
 }
 
+long getLocalFileSize(const std::string& filename) {
+    struct stat stat_buf;
+    int rc = stat(filename.c_str(), &stat_buf);
+    return rc == 0 ? stat_buf.st_size : 0;
+}
+
 bool downloadFile(const std::string& url, const std::string& save_path) {
     CURL *curl = curl_easy_init();
     if (!curl) return false;
 
-    FILE *fp = fopen(save_path.c_str(), "wb");
+    long downloaded_bytes = getLocalFileSize(save_path);
+
+    FILE *fp = fopen(save_path.c_str(), "ab");
     if (!fp) { curl_easy_cleanup(curl); return false; }
 
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+
+    if (downloaded_bytes > 0) {
+        std::cout << "[이어받기] 기존 파일 조각(" << downloaded_bytes << " bytes)을 발견하여 이어서 다운로드합니다." << std::endl;
+        curl_easy_setopt(curl, CURLOPT_RESUME_FROM_LARGE, (curl_off_t)downloaded_bytes);
+    }
 
     CURLcode res = curl_easy_perform(curl);
     fclose(fp);
