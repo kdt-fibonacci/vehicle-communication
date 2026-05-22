@@ -37,9 +37,9 @@ struct EcuVersion {
 };
 
 const std::string VERSION_FILE = "./ecu_versions.json";
-const std::string CHECK_URL = "http://192.168.202.103:4321/ota/check";
-const std::string REPORT_URL = "http://192.168.202.103:4321/ota/report";
-const std::string MQTT_ADDRESS = "tcp://192.168.202.103:1883";
+const std::string CHECK_URL = "http://192.168.203.213:4321/ota/check";
+const std::string REPORT_URL = "http://192.168.203.213:4321/ota/report";
+const std::string MQTT_ADDRESS = "tcp://192.168.203.213:1883";
 const std::string CLIENT_ID = "RPi_OTA_Client";
 const std::string TOPIC = "ota/update";
 const std::string DEVICE_ID = "0001";
@@ -68,12 +68,40 @@ long getLocalFileSize(const std::string& filename) {
     return rc == 0 ? stat_buf.st_size : 0;
 }
 
+long getServerFileSize(const std::string& url) {
+    CURL *curl = curl_easy_init();
+    if (!curl) return -1;
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_NOBODY, 1L); // 헤더만 슥 요청
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
+
+    if (curl_easy_perform(curl) == CURLE_OK) {
+        curl_off_t cl; 
+        if (curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &cl) == CURLE_OK) {
+            curl_easy_cleanup(curl);
+            return (long)cl;
+        }
+    }
+    curl_easy_cleanup(curl);
+    return -1;
+}
+
 bool downloadFile(const std::string& url, const std::string& save_path) {
+    long local_bytes = getLocalFileSize(save_path);
+    long server_bytes = getServerFileSize(url);
+
+    // 1. 💡 [핵심 방어]: 만약 로컬에 이미 받아둔 크기가 서버 원본 크기와 '같거나 더 크다면'
+    // 이미 100% 온전하게 다 받은 파일이므로, 서버를 찌르지 않고 즉시 완료(true) 처리합니다.
+    if (server_bytes > 0 && local_bytes >= server_bytes) {
+        std::cout << "🎯 [DOWNLOAD SKIP] " << save_path << " 파일은 이미 100% 다운로드 완료되어 있습니다. (스킵)" << std::endl;
+        return true; 
+    }
+
     CURL *curl = curl_easy_init();
     if (!curl) return false;
 
-    long downloaded_bytes = getLocalFileSize(save_path);
-
+    // 2. 파일 오픈 모드를 "ab"로 개방 (지우지 않고 이어붙이기)
     FILE *fp = fopen(save_path.c_str(), "ab");
     if (!fp) { curl_easy_cleanup(curl); return false; }
 
@@ -81,9 +109,10 @@ bool downloadFile(const std::string& url, const std::string& save_path) {
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
 
-    if (downloaded_bytes > 0) {
-        std::cout << "[이어받기] 기존 파일 조각(" << downloaded_bytes << " bytes)을 발견하여 이어서 다운로드합니다." << std::endl;
-        curl_easy_setopt(curl, CURLOPT_RESUME_FROM_LARGE, (curl_off_t)downloaded_bytes);
+// 3. 로컬에 받아둔 데이터 조각이 원본보다 작을 때만 안전하게 이어받기(Resume) 가동
+    if (local_bytes > 0 && local_bytes < server_bytes) {
+        std::cout << "[이어받기] 기존 파일 조각(" << local_bytes << " / " << server_bytes << " bytes) 발견. 이어서 받습니다." << std::endl;
+        curl_easy_setopt(curl, CURLOPT_RESUME_FROM_LARGE, (curl_off_t)local_bytes);
     }
 
     CURLcode res = curl_easy_perform(curl);
@@ -114,6 +143,8 @@ void reportStatusToServer(std::string addr, std::string ver, std::string status,
     curl_easy_setopt(curl, CURLOPT_URL, REPORT_URL.c_str());
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data.c_str());
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 2L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 3L);
 
     std::cout << "[Report Content] Status: " << status << " (NRC: " << nrc << ") Forwarding to backend server." << std::endl;
     curl_easy_perform(curl);
@@ -149,11 +180,9 @@ void executeUpdate(const std::string& addr, const std::string& ver, const std::s
     /* LCD 표시용 정보 설정 */
     /* ========================= */
     strncpy(update_ecu_name, addr.c_str(), sizeof(update_ecu_name) - 1);
-
     update_ecu_name[sizeof(update_ecu_name) - 1] = '\0';
 
     strncpy(update_ecu_version, ver.c_str(), sizeof(update_ecu_version) - 1);
-
     update_ecu_version[sizeof(update_ecu_version) - 1] = '\0';
     
     /* ========================= */
@@ -179,13 +208,24 @@ void executeUpdate(const std::string& addr, const std::string& ver, const std::s
     reportStatusToServer(addr, ver, "DOWNLOADING");
     std::string hex_file = addr + "_" + ver + ".hex";
     std::string sig_file = addr + "_" + ver + ".sig";
-    current_progress = 0; // 다운로드 값 넣어주기
-    if (!downloadFile(f_url, hex_file) || !downloadFile(s_url, sig_file)) {
-        current_state = REPORTING;
-        reportStatusToServer(addr, ver, "FAILED", "0xFF");
-        return;
+    while (true) {
+        current_progress = 0; 
+        std::cout << "📥 [DOWNLOAD] 펌웨어 및 서명 패키지 다운로드 다운링크 활성화..." << std::endl;
+        
+        // 두 전송 연산이 모두 무사히 true(완료 혹은 완전 스킵)를 뱉어야 탈출 조건 충족
+        if (downloadFile(f_url, hex_file) && downloadFile(s_url, sig_file)) {
+            std::cout << "✅ [DOWNLOAD SUCCESS] 패키지 무결성 조각 병합 100% 안착 완료!" << std::endl;
+            current_progress = 100;
+            break; 
+        }
+        
+        // 여기에 걸렸다는 건 중간에 전송 소켓이 파괴되었거나, 피어가 다운되었다는 증거
+        std::cerr << "⚠️ [DOWNLOAD INTERRUPT] 백엔드 데이터 전송 노드가 끊겼거나 닫혔습니다." << std::endl;
+        std::cerr << "⏳ [자동 복구 지연] 5초 후 기존에 저장된 바이트 조각 끝점부터 자동으로 이어받기를 가동합니다...\n" << std::endl;
+        
+        // 커널 버퍼 비우기 시간 및 네트워크 어댑터 재정렬을 위해 5초 휴식 (CPU 소모 없음)
+        std::this_thread::sleep_for(std::chrono::seconds(5));
     }
-    current_progress = 100;
 
     /* ========================= */
     /* VERIFICATION */
@@ -238,6 +278,9 @@ void performInitialSync() {
     curl_easy_setopt(curl, CURLOPT_URL, CHECK_URL.c_str());
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, req_data.c_str());
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 3L); // 연결 제한 3초
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
+
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_string);
 
@@ -338,6 +381,10 @@ void* ota_worker_thread(void* arg)
 {
     while (true)
     {
+        if (current_state == IDLE || current_state == OFF) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            continue;
+        }
         if(current_state == PENDING) continue;
         queue_mutex.lock();
 
