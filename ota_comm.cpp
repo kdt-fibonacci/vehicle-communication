@@ -376,6 +376,27 @@ void runOtaService() {
     curl_global_cleanup();
 }
 
+std::pair<int, int> parseVersion(const std::string& versionStr) {
+    int major = 0, minor = 0;
+    std::stringstream ss(versionStr);
+    char dot;
+    if (ss >> major >> dot >> minor) {
+        return {major, minor};
+    }
+    return {0, 0};
+}
+
+// 💡 [추가] 구버전 여부를 안전하게 검사하는 함수 (target <= current 이면 true)
+bool isDowngradeOrSame(const std::string& targetVer, const std::string& currentVer) {
+    auto target = parseVersion(targetVer);
+    auto current = parseVersion(currentVer);
+
+    if (target.first < current.first) return true;  // Major 버전이 낮음
+    if (target.first == current.first && target.second <= current.second) return true; // Minor 버전이 낮거나 같음
+
+    return false;
+}
+
 // 업데이트 큐 검사하며 업데이트 지시를 내리는 스레드 함수
 void* ota_worker_thread(void* arg)
 {
@@ -402,6 +423,35 @@ void* ota_worker_thread(void* arg)
         UpdateItem item = update_queue.front();
 
         queue_mutex.unlock();
+
+        auto localEcus = loadLocalVersions();
+        bool isInvalidVersion = false;
+
+        for (const auto& ecu : localEcus) {
+            if (ecu.address == item.addr) {
+                // 큐에 담긴 타겟 버전이 현재 파일에 기록된 버전보다 낮거나 같다면 필터링 대상
+                if (isDowngradeOrSame(item.ver, ecu.version)) {
+                    std::cerr << "\n⚠️ [ROLLBACK BLOCK] 제어기 0x" << item.addr 
+                              << "의 요청 버전(" << item.ver << ")이 현재 버전(" 
+                              << ecu.version << ")보다 낮거나 같습니다. UI를 띄우지 않고 대기열에서 자동 폐기합니다." << std::endl;
+                    isInvalidVersion = true;
+                }
+                break;
+            }
+        }
+
+        // 💡 구버전이거나 이미 반영된 동일 버전이면 사용자를 귀찮게 하지 않고 큐에서 즉시 무소음 삭제(pop)
+        if (isInvalidVersion) {
+            queue_mutex.lock();
+            if (!update_queue.empty() && update_queue.front().addr == item.addr) {
+                update_queue.pop(); 
+            }
+            queue_mutex.unlock();
+
+            if (update_queue.empty()) current_state = WAIT;
+            else                      current_state = PENDING;
+            continue; // 💥 하단의 executeUpdate(READY 진입)를 건너뛰고 다음 작업으로 패스!
+        }
 
         executeUpdate(item.addr, item.ver, item.firmware_url, item.signature_url);
 
