@@ -13,6 +13,8 @@ void lcd_update_screen(
 
 void lcd_downloading_screen(int percent);
 
+void lcd_flashing_screen(int percent);
+
 void lcd_verify_screen();
 
 void lcd_success_screen();

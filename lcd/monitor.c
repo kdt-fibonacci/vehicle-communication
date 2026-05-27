@@ -34,8 +34,10 @@ typedef enum
 MENU_STATE current_menu = MENU_YES;
 MENU_STATE prev_menu    = -1;
 
-int current_progress = 0;
-int prev_progress    = -1;
+int current_download_progress = 0;
+int current_install_progress = 0;
+int prev_download_progress    = -1;
+int prev_install_progress = -1;
 
 char update_ecu_name[16];
 char update_ecu_version[16];
@@ -78,19 +80,17 @@ void render_screen()
 
         case DOWNLOAD:
 
-            lcd_downloading_screen(current_progress);
+            lcd_downloading_screen(current_download_progress);
 
+            break;
+
+        case INSTALL:
+            lcd_flashing_screen(current_install_progress);
             break;
 
         case VERIFICATION:
 
             lcd_verify_screen();
-
-            break;
-
-        case INSTALL:
-
-            
 
             break;
 
@@ -241,13 +241,15 @@ void* lcd_thread(void* arg)
     {
         if (prev_state    != current_state ||
             prev_menu     != current_menu  ||
-            prev_progress != current_progress)
+            prev_download_progress != current_download_progress ||
+            prev_install_progress != current_install_progress)
         {
             render_screen();
 
             prev_state    = current_state;
             prev_menu     = current_menu;
-            prev_progress = current_progress;
+            prev_download_progress = current_download_progress;
+            prev_install_progress = current_install_progress;
         }
 
         usleep(300000);

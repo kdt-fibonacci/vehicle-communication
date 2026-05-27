@@ -13,6 +13,7 @@
 #include "state.h"
 
 extern STATE current_state;
+extern int current_install_progress;
 
 const int DOIP_PORT = 13400;
 const uint16_t RPI_SA = 0x0E00; 
@@ -186,6 +187,7 @@ int recv_with_retry(int sock, uint8_t* buf, int max_len) {
 }
 
 int startOtaTransfer(const std::string& targetAddrStr, const std::string& version, const std::string& gatewayIp) {
+    current_install_progress = 0;
     uint16_t targetAddr = (uint16_t)std::stoul(targetAddrStr, nullptr, 16);
     std::string hexPath = targetAddrStr + "_" + version + ".hex";
     

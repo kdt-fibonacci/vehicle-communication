@@ -24,7 +24,7 @@ std::mutex queue_mutex;
 extern STATE current_state;
 extern STATE prev_state;
 
-extern int current_progress;
+extern int current_download_progress;
 
 extern char update_ecu_name[16];
 extern char update_ecu_version[16];
@@ -37,9 +37,9 @@ struct EcuVersion {
 };
 
 const std::string VERSION_FILE = "./ecu_versions.json";
-const std::string CHECK_URL = "http://192.168.203.213:4321/ota/check";
-const std::string REPORT_URL = "http://192.168.203.213:4321/ota/report";
-const std::string MQTT_ADDRESS = "tcp://192.168.203.213:1883";
+const std::string CHECK_URL = "http://192.168.201.49:4321/ota/check";
+const std::string REPORT_URL = "http://192.168.201.49:4321/ota/report";
+const std::string MQTT_ADDRESS = "tcp://192.168.201.49:1883";
 const std::string CLIENT_ID = "RPi_OTA_Client";
 const std::string TOPIC = "ota/update";
 const std::string DEVICE_ID = "0001";
@@ -209,13 +209,13 @@ void executeUpdate(const std::string& addr, const std::string& ver, const std::s
     std::string hex_file = addr + "_" + ver + ".hex";
     std::string sig_file = addr + "_" + ver + ".sig";
     while (true) {
-        current_progress = 0; 
+        current_download_progress = 0; 
         std::cout << "📥 [DOWNLOAD] 펌웨어 및 서명 패키지 다운로드 다운링크 활성화..." << std::endl;
         
         // 두 전송 연산이 모두 무사히 true(완료 혹은 완전 스킵)를 뱉어야 탈출 조건 충족
         if (downloadFile(f_url, hex_file) && downloadFile(s_url, sig_file)) {
             std::cout << "✅ [DOWNLOAD SUCCESS] 패키지 무결성 조각 병합 100% 안착 완료!" << std::endl;
-            current_progress = 100;
+            current_download_progress = 100;
             break; 
         }
         
@@ -243,7 +243,6 @@ void executeUpdate(const std::string& addr, const std::string& ver, const std::s
     /* ========================= */
     current_state = INSTALL;
     reportStatusToServer(addr, ver, "FLASHING");
-    
     int result = startOtaTransfer(addr, ver, GATEWAY_IP);
 
     // State 11: REPORTING

@@ -76,6 +76,28 @@ void lcd_downloading_screen(int percent)
     lcd_print(line);
 }
 
+void lcd_flashing_screen(int percent)
+{
+    char line[17];
+
+    lcd_clear();
+
+    lcd_set_cursor(0, 0);
+
+    lcd_print("FLASHING");
+
+    snprintf(
+        line,
+        sizeof(line),
+        "%d%%",
+        percent
+    );
+
+    lcd_set_cursor(1, 0);
+
+    lcd_print(line);
+}
+
 void lcd_verify_screen()
 {
     lcd_clear();
