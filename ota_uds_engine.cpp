@@ -251,11 +251,11 @@ int startOtaTransfer(const std::string& targetAddrStr, const std::string& versio
         fullData.insert(fullData.end(), chunks[i].data.begin(), chunks[i].data.end());
     }
 
-    // 💡 [핵심] 0x34(Request Download)를 루프 밖에서 단 1번 호출
+    // 0x34(Request Download)를 루프 밖에서 호출
     nrc = requestDownload(sock, targetAddr, startAddr, fullData.size());
     if (nrc != 0) { close(sock); return nrc; }
 
-    // 💡 [핵심] 0x36(Transfer Data)을 전체 데이터에 대해 루프 수행
+    // 0x36(Transfer Data)을 전체 데이터에 대해 루프 수행
     uint8_t sn = 1;
     uint32_t offset = 0;
     while (offset < fullData.size()) {
@@ -263,7 +263,7 @@ int startOtaTransfer(const std::string& targetAddrStr, const std::string& versio
         std::vector<uint8_t> udsPayload = { sn };
         udsPayload.insert(udsPayload.end(), fullData.begin() + offset, fullData.begin() + offset + currLen);
         
-        // 💡 sn 로그 출력 추가
+        // sn 로그 출력 추가
         std::cout << "[UDS] Sending 0x36 block sn: 0x" << std::hex << (int)sn 
                   << " | Offset: " << std::dec << offset << "/" << fullData.size() << std::endl;
 
@@ -286,10 +286,10 @@ int startOtaTransfer(const std::string& targetAddrStr, const std::string& versio
         }
     }
 
-    // 💡 [핵심] 0x37(Transfer Exit)을 루프 밖에서 단 1번 호출
+    // 0x37(Transfer Exit)을 루프 밖에서 호출
     if ((nrc = exitTransfer(sock, targetAddr)) != 0) { close(sock); return nrc; }
     
-    // 💡 [핵심] 0x31(Verify Integrity)을 루프 밖에서 단 1번 호출
+    // 0x31(Verify Integrity)을 루프 밖에서 호출
     uint32_t checksum = calculateChunkChecksum(fullData);
     if ((nrc = verifyIntegrity(sock, targetAddr, checksum)) != 0) { close(sock); return nrc; }
 

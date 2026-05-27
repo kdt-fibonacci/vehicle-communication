@@ -37,9 +37,9 @@ struct EcuVersion {
 };
 
 const std::string VERSION_FILE = "./ecu_versions.json";
-const std::string CHECK_URL = "http://192.168.203.213:4321/ota/check";
-const std::string REPORT_URL = "http://192.168.203.213:4321/ota/report";
-const std::string MQTT_ADDRESS = "tcp://192.168.203.213:1883";
+const std::string CHECK_URL = "http://192.168.201.49:4321/ota/check";
+const std::string REPORT_URL = "http://192.168.201.49:4321/ota/report";
+const std::string MQTT_ADDRESS = "tcp://192.168.201.49:1883";
 const std::string CLIENT_ID = "RPi_OTA_Client";
 const std::string TOPIC = "ota/update";
 const std::string DEVICE_ID = "0001";
