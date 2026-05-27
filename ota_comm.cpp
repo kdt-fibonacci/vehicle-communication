@@ -37,9 +37,9 @@ struct EcuVersion {
 };
 
 const std::string VERSION_FILE = "./ecu_versions.json";
-const std::string CHECK_URL = "http://192.168.201.49:4321/ota/check";
-const std::string REPORT_URL = "http://192.168.201.49:4321/ota/report";
-const std::string MQTT_ADDRESS = "tcp://192.168.201.49:1883";
+const std::string CHECK_URL = "http://192.168.203.213:4321/ota/check";
+const std::string REPORT_URL = "http://192.168.203.213:4321/ota/report";
+const std::string MQTT_ADDRESS = "tcp://192.168.203.213:1883";
 const std::string CLIENT_ID = "RPi_OTA_Client";
 const std::string TOPIC = "ota/update";
 const std::string DEVICE_ID = "0001";
@@ -406,7 +406,7 @@ void* ota_worker_thread(void* arg)
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
             continue;
         }
-        if(current_state == PENDING) continue;
+
         queue_mutex.lock();
 
         if (update_queue.empty())
@@ -452,6 +452,8 @@ void* ota_worker_thread(void* arg)
             else                      current_state = PENDING;
             continue; // 💥 하단의 executeUpdate(READY 진입)를 건너뛰고 다음 작업으로 패스!
         }
+
+        if(current_state == PENDING) continue;
 
         executeUpdate(item.addr, item.ver, item.firmware_url, item.signature_url);
 
