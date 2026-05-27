@@ -46,21 +46,52 @@ void sendUdsPacket(int sock, uint16_t targetAddr, uint8_t sid, const std::vector
 }
 
 int checkUdsResponse(uint8_t* res, int len, uint8_t expectedPositiveSid, uint16_t expectedRid = 0) {
-    if (len < 13) return -100;
-    uint8_t sid = res[12];
+    // 1. 수신한 원시 바이너리 데이터 패킷 터미널에 Hex 형태로 출력
+    std::cout << "[DoIP][RX] Raw Packet (Len=" << len << "): ";
+    std::ios_base::fmtflags f(std::cout.flags()); // 기존 std::cout 포맷 백업
+    for (int i = 0; i < len; ++i) {
+        std::cout << std::setw(2) << std::setfill('0') << std::hex << (int)res[i] << " ";
+    }
+    std::cout << std::endl;
+    std::cout.flags(f); // 기존 std::cout 포맷 복원
+
+    // 2. 버퍼 내에서 유효한 DoIP Diagnostic Message 헤더 마커(0x02 FD 80 01) 동적 탐색
+    int doip_offset = -1;
+    for (int i = 0; i <= len - 8; i++) {
+        if (res[i] == 0x02 && res[i+1] == 0xFD && res[i+2] == 0x80 && res[i+3] == 0x01) {
+            doip_offset = i;
+            break;
+        }
+    }
+
+    if (doip_offset == -1) {
+        std::cerr << "[DEBUG ERROR] DoIP Diagnostic Message Header not found in receive buffer." << std::endl;
+        return -100; 
+    }
+
+    // 3. DoIP 헤더(8바이트) + 주소 정보(SA 2바이트, TA 2바이트)를 반영한 동적 SID 인덱스 획득
+    int sid_index = doip_offset + 12;
+    if (sid_index >= len) return -100;
+
+    uint8_t sid = res[sid_index];
 
     if (sid == expectedPositiveSid) {
         if (expectedRid != 0) {
-            uint16_t receivedRid = (res[14] << 8) | res[15];
+            uint16_t receivedRid = (res[sid_index + 2] << 8) | res[sid_index + 3];
             if (receivedRid != expectedRid) return -101;
         }
         return 0;
     } 
     else if (sid == 0x7F) {
-        uint8_t nrc = res[14];
+        uint8_t nrc = res[sid_index + 2];
         if (nrc == 0x78) return 0x78;
         return nrc;
     }
+
+    // 기대하지 않은 엉뚱한 매칭 에러 시 정보 표출
+    std::cout << "⚠️ [MISMATCH] Expected SID: 0x" << std::hex << (int)expectedPositiveSid 
+              << ", Detected SID: 0x" << (int)sid << std::dec << " at index " << sid_index << std::endl;
+
     return -102;
 }
 
@@ -126,6 +157,34 @@ int requestBankSwap(int sock, uint16_t targetAddr) {
     return checkUdsResponse(res, len, 0x71);
 }
 
+// ECU 하드 리셋 요청 함수 (0x11 01)
+int requestEcuReset(int sock, uint16_t targetAddr) {
+    std::cout << "[UDS] Sending ECU Hard Reset Command (0x11 01)..." << std::endl;
+    std::vector<uint8_t> p = { 0x01 }; // 0x01: hardReset
+    sendUdsPacket(sock, targetAddr, 0x11, p);
+
+    uint8_t res[64];
+    int len = recv(sock, res, sizeof(res), 0);
+    return checkUdsResponse(res, len, 0x51); // 0x51: Positive SID
+}
+
+int recv_with_retry(int sock, uint8_t* buf, int max_len) {
+    int retries = 5; // 최대 5번 재시도 (ECU 처리 시간 확보)
+    while (retries > 0) {
+        int rLen = recv(sock, buf, max_len, 0);
+        if (rLen > 0) return rLen; // 데이터 수신 성공
+        
+        // 데이터가 아직 안 왔으면(errno 11) 50ms 대기 후 재시도
+        if (rLen == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            retries--;
+        } else {
+            return -1; // 진짜 소켓 에러
+        }
+    }
+    return -1; // 타임아웃
+}
+
 int startOtaTransfer(const std::string& targetAddrStr, const std::string& version, const std::string& gatewayIp) {
     uint16_t targetAddr = (uint16_t)std::stoul(targetAddrStr, nullptr, 16);
     std::string hexPath = targetAddrStr + "_" + version + ".hex";
@@ -134,7 +193,7 @@ int startOtaTransfer(const std::string& targetAddrStr, const std::string& versio
     std::ifstream file(hexPath);
     if (!file.is_open()) { std::cerr << "[ERROR] Cannot open HEX file." << std::endl; return -1; }
 
-    return 0; // 임시로 바로 통과되도록
+    // return 0; // 임시로 바로 통과되도록
     
     std::vector<DataChunk> chunks;
     uint32_t baseAddr = 0; std::string line;
@@ -182,35 +241,59 @@ int startOtaTransfer(const std::string& targetAddrStr, const std::string& versio
         close(sock); return nrc;
     }
 
+    std::vector<uint8_t> fullData;
+    uint32_t startAddr = chunks[0].address;
     for (size_t i = 0; i < chunks.size(); ++i) {
-        auto& chunk = chunks[i];
-        if ((nrc = requestDownload(sock, targetAddr, chunk.address, chunk.data.size())) != 0) { close(sock); return nrc; }
-        
-        uint8_t sn = 1;
-        uint32_t offset = 0;
-        while (offset < chunk.data.size()) {
-            uint32_t currLen = (chunk.data.size() - offset > 1024) ? 1024 : (chunk.data.size() - offset);
-            std::vector<uint8_t> udsPayload = { sn };
-            udsPayload.insert(udsPayload.end(), chunk.data.begin() + offset, chunk.data.begin() + offset + currLen);
-            
-            sendUdsPacket(sock, targetAddr, 0x36, udsPayload);
-            uint8_t res_buf[1500];
-            int rLen = recv(sock, res_buf, sizeof(res_buf), 0);
-            int transferRes = checkUdsResponse(res_buf, rLen, 0x76);
-            
-            if (transferRes == 0) {
-                offset += currLen;
-                sn = (sn == 0xFF) ? 0x00 : sn + 1;
-            } else { close(sock); return transferRes; }
+        if (i > 0) {
+            uint32_t gap = chunks[i].address - (chunks[i-1].address + chunks[i-1].data.size());
+            if (gap > 0) fullData.insert(fullData.end(), gap, 0xFF); // 갭은 0xFF 패딩
         }
-        if ((nrc = exitTransfer(sock, targetAddr)) != 0) { close(sock); return nrc; }
-        
-        uint32_t checksum = calculateChunkChecksum(chunk.data);
-        if ((nrc = verifyIntegrity(sock, targetAddr, checksum)) != 0) { close(sock); return nrc; }
+        fullData.insert(fullData.end(), chunks[i].data.begin(), chunks[i].data.end());
     }
 
-    std::cout << "\n✅ Data flashing completed in background." << std::endl;
+    // 💡 [핵심] 0x34(Request Download)를 루프 밖에서 단 1번 호출
+    nrc = requestDownload(sock, targetAddr, startAddr, fullData.size());
+    if (nrc != 0) { close(sock); return nrc; }
 
+    // 💡 [핵심] 0x36(Transfer Data)을 전체 데이터에 대해 루프 수행
+    uint8_t sn = 1;
+    uint32_t offset = 0;
+    while (offset < fullData.size()) {
+        uint32_t currLen = (fullData.size() - offset > 1024) ? 1024 : (fullData.size() - offset);
+        std::vector<uint8_t> udsPayload = { sn };
+        udsPayload.insert(udsPayload.end(), fullData.begin() + offset, fullData.begin() + offset + currLen);
+        
+        // 💡 sn 로그 출력 추가
+        std::cout << "[UDS] Sending 0x36 block sn: 0x" << std::hex << (int)sn 
+                  << " | Offset: " << std::dec << offset << "/" << fullData.size() << std::endl;
+
+        sendUdsPacket(sock, targetAddr, 0x36, udsPayload);
+        
+        uint8_t res_buf[1500];
+        int rLen = recv_with_retry(sock, res_buf, sizeof(res_buf));
+        if (rLen < 0)
+        {
+            printf("recv failed: errno=%d (%s)\n", errno, strerror(errno));
+        }
+        int transferRes = checkUdsResponse(res_buf, rLen, 0x76);
+        
+        if (transferRes == 0) {
+            offset += currLen;
+            sn = (sn == 0xFF) ? 0x00 : sn + 1; // 0x01~0xFF 반복
+        } else {
+            std::cerr << "[ERROR] Transfer Data failed with NRC: 0x" << std::hex << transferRes << std::dec << std::endl;
+            close(sock); return transferRes;
+        }
+    }
+
+    // 💡 [핵심] 0x37(Transfer Exit)을 루프 밖에서 단 1번 호출
+    if ((nrc = exitTransfer(sock, targetAddr)) != 0) { close(sock); return nrc; }
+    
+    // 💡 [핵심] 0x31(Verify Integrity)을 루프 밖에서 단 1번 호출
+    uint32_t checksum = calculateChunkChecksum(fullData);
+    if ((nrc = verifyIntegrity(sock, targetAddr, checksum)) != 0) { close(sock); return nrc; }
+
+    std::cout << "\n✅ Flashing completed successfully!" << std::endl;
     // State 8: WAIT_ACTIVATION
 current_state = WAIT_ACTIVATION; // state.h 전역 변수 동기화
     
@@ -262,7 +345,17 @@ current_state = WAIT_ACTIVATION; // state.h 전역 변수 동기화
         close(sock); return swapResult;
     }
 
-    std::cout << "🚀 [SUCCESS] Bank swap command accepted. Target ECU is rebooting with new firmware..." << std::endl;
+    std::cout << "🚀 [SUCCESS] Bank swap command accepted. Activating Reset routing..." << std::endl;
+
+    // 💡 [새로 추가된 제어 흐름] 단계 8: 뱅크 스왑 예약 성공 직후 하드 리셋(0x11 01) 연쇄 사출
+    int resetResult = requestEcuReset(sock, targetAddr);
+    if (resetResult != 0) {
+        std::cerr << "⚠️ [WARNING] Bank swap succeeded, but ECU Reset command was rejected. Code: 0x" 
+                  << std::hex << resetResult << std::dec << std::endl;
+        close(sock); return resetResult;
+    }
+
+    std::cout << "🎉 [COMPLETED] Target ECU received Hard Reset and is rebooting with new firmware!" << std::endl;
     close(sock);
     return 0;
 }
